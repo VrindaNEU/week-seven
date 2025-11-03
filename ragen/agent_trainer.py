@@ -56,7 +56,7 @@ class MultiTurnAPOTrainer(APOTrainer):
         self.adaptive_clip = apo_cfg.get('adaptive_clip', False)
         self._grad_hist = deque(maxlen=100)
 
-        # Some generators don’t support min_new_tokens; guard it
+        # Some generators don't support min_new_tokens; guard it
         samp_cfg = config.get('sampling', {})
         self.use_min_new_tokens = samp_cfg.get('use_min_new_tokens', False)
         self.min_new_tokens = samp_cfg.get('min_new_tokens', 10)
@@ -133,52 +133,104 @@ class MultiTurnAPOTrainer(APOTrainer):
 
     # ---------- multi-turn rollout ----------
 
-    def _rollout_trajectory(self, prompt: str, task_data: Dict, max_turns: Optional[int] = None) -> Dict:
+    def _rollout_trajectory(self, prompt: str, task_data: Dict, max_turns: Optional[int] = None) -> Optional[Dict]:
+        """
+        Collect a multi-turn trajectory with robust error handling.
+        Returns None if rollout completely fails.
+        """
         if max_turns is None:
             max_turns = self.max_turns
 
-        # Reset env with task
-        task = dict(task_data)  # avoid mutating caller
-        task['prompt'] = prompt
-        state = self.environment.reset(task)
+        try:
+            # Reset env with task
+            task = dict(task_data)  # avoid mutating caller
+            task['prompt'] = prompt
+            state = self.environment.reset(task)
+            
+            # Validate initial state
+            if state is None or not state:
+                print(f"⚠️  Invalid initial state from reset: {state}")
+                return None
 
-        actions, rewards, states = [], [], [state]
-        done = False
+            actions, rewards, states = [], [], [state]
+            done = False
 
-        for _ in range(max_turns):
-            obs_text = self._state_to_text(state)
-            gen_kwargs = dict(
-                max_length=self.gen_max_length,
-                temperature=self.temperature,
-                do_sample=True,
-                top_p=self.top_p,
-                top_k=self.top_k
-            )
-            if self.use_min_new_tokens:
-                gen_kwargs["min_new_tokens"] = self.min_new_tokens
+            for turn in range(max_turns):
+                try:
+                    obs_text = self._state_to_text(state)
+                    
+                    # Validate observation text
+                    if not obs_text or not isinstance(obs_text, str):
+                        print(f"⚠️  Invalid observation at turn {turn}: {obs_text}")
+                        break
+                    
+                    gen_kwargs = dict(
+                        max_length=self.gen_max_length,
+                        temperature=self.temperature,
+                        do_sample=True,
+                        top_p=self.top_p,
+                        top_k=self.top_k
+                    )
+                    if self.use_min_new_tokens:
+                        gen_kwargs["min_new_tokens"] = self.min_new_tokens
 
-            action = self.policy.generate([obs_text], **gen_kwargs)[0]
-            next_state, reward, done, info = self.environment.step(action)
+                    # Generate action
+                    generated = self.policy.generate([obs_text], **gen_kwargs)
+                    if not generated or not generated[0]:
+                        print(f"⚠️  Empty generation at turn {turn}")
+                        break
+                    action = generated[0]
+                    
+                    # Execute step
+                    next_state, reward, done, info = self.environment.step(action)
+                    
+                    # Validate step results
+                    if next_state is None:
+                        print(f"⚠️  None state returned at turn {turn}")
+                        # Use the error message as state if available
+                        next_state = info.get('error', 'Error occurred')
+                    
+                    actions.append(action)
+                    rewards.append(float(reward))
+                    states.append(next_state)
+                    state = next_state
+                    
+                    if done:
+                        break
+                        
+                except Exception as e:
+                    print(f"⚠️  Error during turn {turn}: {e}")
+                    # Don't break immediately - record what we have so far
+                    break
 
-            actions.append(action)
-            rewards.append(float(reward))
-            states.append(next_state)
-            state = next_state
-            if done:
-                break
-
-        total_reward = float(np.sum(rewards)) if rewards else 0.0
-        # Keep completion as actions-only to avoid supervising prompt tokens twice
-        full_text = self._concat_trajectory(actions)
-        return {
-            'states': states,
-            'actions': actions,
-            'rewards': rewards,
-            'total_reward': total_reward,
-            'full_text': full_text,
-            'num_turns': len(actions),
-            'done': done
-        }
+            # Validate trajectory before returning
+            if not actions:
+                print(f"⚠️  No actions collected in trajectory")
+                return None
+            
+            total_reward = float(np.sum(rewards)) if rewards else 0.0
+            full_text = self._concat_trajectory(actions)
+            
+            # Ensure we have valid text
+            if not full_text:
+                print(f"⚠️  Empty full_text after concatenation")
+                full_text = " "  # Minimum valid text
+            
+            return {
+                'states': states,
+                'actions': actions,
+                'rewards': rewards,
+                'total_reward': total_reward,
+                'full_text': full_text,
+                'num_turns': len(actions),
+                'done': done
+            }
+            
+        except Exception as e:
+            print(f"⚠️  Rollout completely failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def _concat_trajectory(self, actions: List[str]) -> str:
         """
@@ -232,7 +284,8 @@ class MultiTurnAPOTrainer(APOTrainer):
             for _ in range(num_samples):
                 try:
                     traj = self._rollout_trajectory(p, problem, max_turns=min(self.max_turns, 5))
-                    sample_rewards.append(traj['total_reward'])
+                    if traj is not None:
+                        sample_rewards.append(traj['total_reward'])
                 except Exception as e:
                     print(f"    Warning: V* sampling failed: {e}")
             if not sample_rewards:
@@ -282,20 +335,41 @@ class MultiTurnAPOTrainer(APOTrainer):
             trajectories = []
             rollout_failures = 0
             for p, prob in zip(prompts, batch):
-                try:
-                    traj = self._rollout_trajectory(p, prob, self.max_turns)
-                except Exception as e:
+                traj = self._rollout_trajectory(p, prob, self.max_turns)
+                if traj is None:
+                    # Complete failure - use minimal dummy trajectory
                     rollout_failures += 1
-                    print(f"Warning: Rollout failed: {e}")
-                    # Dummy trajectory as graceful fallback
+                    print(f"Warning: Rollout returned None")
                     traj = {
-                        'states': [], 'actions': [], 'rewards': [0.0],
-                        'total_reward': 0.0, 'full_text': '',
-                        'num_turns': 0, 'done': False
+                        'states': ['error'], 
+                        'actions': ['search[dummy]'], 
+                        'rewards': [0.0],
+                        'total_reward': 0.0, 
+                        'full_text': 'search[dummy]',
+                        'num_turns': 1, 
+                        'done': True
                     }
                 trajectories.append(traj)
+                
             if rollout_failures > 0:
                 print(f"  ⚠️  {rollout_failures}/{len(batch)} rollouts failed")
+            
+            # Additional validation: ensure all trajectories have content
+            valid_trajectories = [t for t in trajectories if t['actions'] and t['full_text']]
+            if len(valid_trajectories) < len(trajectories):
+                print(f"  ⚠️  {len(trajectories) - len(valid_trajectories)} trajectories invalid after collection")
+            
+            # If ALL trajectories failed, skip this step
+            if not valid_trajectories:
+                print("  ⚠️  ALL trajectories failed - skipping step")
+                return 0.0, {
+                    'loss': 0.0, 'avg_reward': 0.0, 'avg_advantage': 0.0,
+                    'avg_v_star': 0.0, 'avg_kl_penalty': 0.0,
+                    'avg_turns': 0.0, 'success_rate': 0.0,
+                    'weight_mean': 1.0, 'weight_std': 0.0,
+                    'grad_global_norm_unclipped': 0.0,
+                    'rollout_failures': len(batch),
+                }
 
             generated_texts = [t['full_text'] for t in trajectories]
             rewards_t = torch.tensor([t['total_reward'] for t in trajectories],
@@ -303,7 +377,10 @@ class MultiTurnAPOTrainer(APOTrainer):
 
             # 3) Advantages / weights
             advantages = rewards_t - V_star_t
-            adv_norm = (advantages - advantages.mean()) / (advantages.std() + 1e-6)
+            if len(advantages) > 1:
+                adv_norm = (advantages - advantages.mean()) / (advantages.std() + 1e-6)
+            else:
+                adv_norm = advantages - advantages.mean()
             adv_norm = adv_norm.clamp(-self.adv_clip, self.adv_clip).detach()
 
             if self.weighting_scheme == 'exp':

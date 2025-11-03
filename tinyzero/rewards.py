@@ -1,6 +1,19 @@
+
+print("="*60)
+print("🔍 REWARDS MODULE LOADED - VERSION 2.0 WITH WEBSHOP SUPPORT")
+print("="*60)
+"""
+Unified reward system for TinyZero and RAGEN
+Supports both math tasks (TinyZero) and agent tasks (RAGEN/WebShop)
+"""
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Union
 import math
+
+
+# ============================================================
+# MATH REWARDS (TinyZero Original)
+# ============================================================
 
 def extract_final_answer(text: str) -> Optional[float]:
     """
@@ -145,6 +158,148 @@ def check_countdown_reasoning(text: str, numbers: list, target: int) -> bool:
     return numbers_used >= 2 and has_operations and has_steps
 
 
+def compute_math_reward(
+    generated_text: str,
+    problem: Dict[str, Any],
+    tolerance: float = 0.01,
+    check_reasoning: bool = False
+) -> float:
+    """
+    Compute reward for math problems.
+    Binary reward: 1.0 if correct, 0.0 otherwise.
+    """
+    predicted_answer_num = extract_final_answer(generated_text)
+    
+    if predicted_answer_num is None:
+        return 0.0
+    
+    # Check Final Answer
+    if problem.get('task') == 'multiplication':
+        correct_answer = problem['answer']
+        if math.isclose(predicted_answer_num, correct_answer, abs_tol=0.01):
+            return 1.0
+    
+    elif problem.get('task') == 'countdown':
+        target = problem['target']
+        if target != 0 and math.isclose(predicted_answer_num, target, rel_tol=tolerance):
+            return 1.0
+        elif target == 0 and math.isclose(predicted_answer_num, target, abs_tol=tolerance):
+            return 1.0
+    
+    return 0.0
+
+
+# ============================================================
+# WEBSHOP REWARDS (RAGEN Extension)
+# ============================================================
+
+def compute_webshop_reward(
+    trajectory: Dict[str, Any],
+    task: Dict[str, Any]
+) -> float:
+    """
+    Compute reward for WebShop trajectory with partial credit.
+    
+    Rewards:
+    - 1.0: Successfully purchased correct product
+    - 0.0-0.6: Partial credit for exploration
+    """
+    # Debug logging
+    print(f"🔍 WebShop Reward - trajectory type: {type(trajectory).__name__}")
+    if isinstance(trajectory, dict) and 'actions' in trajectory:
+        print(f"   Actions: {len(trajectory.get('actions', []))}, Total reward: {trajectory.get('total_reward', 0.0)}")
+    
+    if not trajectory or 'total_reward' not in trajectory:
+        print(f"⚠️  Invalid trajectory: {trajectory}")
+        return 0.0
+    
+    # Primary reward from environment
+    env_reward = float(trajectory.get('total_reward', 0.0))
+    
+    # If environment gave success reward, return it
+    if env_reward >= 0.9:
+        print(f"✓ Success! env_reward={env_reward}")
+        return 1.0
+    
+    # Otherwise, add partial credit based on actions
+    actions = trajectory.get('actions', [])
+    rewards = trajectory.get('rewards', [])
+    
+    if not actions:
+        print(f"⚠️  No actions in trajectory")
+        return 0.0
+    
+    # Partial credit heuristics
+    partial_reward = 0.0
+    
+    # 1. Check if we got ANY positive reward during trajectory
+    if rewards and max(rewards) > 0:
+        partial_reward += 0.5  # At least we did something right
+    
+    # 2. Check action quality
+    search_count = sum(1 for a in actions if 'search[' in str(a).lower())
+    click_count = sum(1 for a in actions if 'click[' in str(a).lower())
+    buy_count = sum(1 for a in actions if 'buy' in str(a).lower())
+    
+    # Reward good exploration
+    if search_count > 0:
+        partial_reward += 0.1  # Did at least one search
+    if click_count > 0:
+        partial_reward += 0.2  # Clicked on products
+    if buy_count > 0:
+        partial_reward += 0.2  # Attempted purchase
+    
+    # 3. Length penalty: penalize doing nothing or minimal actions
+    if len(actions) < 2:
+        partial_reward *= 0.5
+    
+    final_reward = min(env_reward + partial_reward, 1.0)
+    print(f"   Partial credit: env={env_reward:.2f} + partial={partial_reward:.2f} = {final_reward:.2f}")
+    
+    return final_reward
+
+
+# ============================================================
+# UNIFIED REWARD FUNCTION (Auto-Detect)
+# ============================================================
+
+def compute_reward(
+    generated_output: Union[str, Dict[str, Any]],
+    problem: Dict[str, Any],
+    tolerance: float = 0.01,
+    require_cot: bool = False
+) -> float:
+    """
+    Unified reward function - auto-detects environment type.
+    
+    Supports:
+    - TinyZero math tasks (text input)
+    - RAGEN WebShop tasks (trajectory dict input)
+    
+    Args:
+        generated_output: Either text string (math) or trajectory dict (WebShop)
+        problem: Problem/task specification
+        tolerance: Tolerance for numerical answers
+        require_cot: Whether to require chain-of-thought (math only)
+    
+    Returns:
+        Reward value (0.0 to 1.0)
+    """
+    # Auto-detect based on input type
+    if isinstance(generated_output, dict):
+        # Dictionary with trajectory info → WebShop
+        if 'actions' in generated_output or 'total_reward' in generated_output:
+            return compute_webshop_reward(generated_output, problem)
+    
+    # String output → Math task
+    if isinstance(generated_output, str):
+        return compute_math_reward(generated_output, problem, tolerance, require_cot)
+    
+    # Unknown type
+    print(f"⚠️  Unknown output type for reward: {type(generated_output)}")
+    return 0.0
+
+
 def compute_reward_with_partial_credit(
     generated_text: str,
     problem: Dict[str, Any],
@@ -153,8 +308,9 @@ def compute_reward_with_partial_credit(
 ) -> float:
     """
     Compute reward with PARTIAL CREDIT for reasoning AND format.
+    (For TinyZero math tasks only)
     
-    Reward Scheme (NEW - checks format!):
+    Reward Scheme:
     - 1.0: Correct answer + proper format + good reasoning
     - 0.8: Correct answer + proper format, weak reasoning
     - 0.6: Correct answer + good reasoning, wrong format
@@ -172,12 +328,12 @@ def compute_reward_with_partial_credit(
     has_proper_format = check_proper_format(generated_text)
     
     # --- Check Final Answer ---
-    if problem['task'] == 'multiplication':
+    if problem.get('task') == 'multiplication':
         correct_answer = problem['answer']
         if math.isclose(predicted_answer_num, correct_answer, abs_tol=0.01):
             final_answer_correct = True
     
-    elif problem['task'] == 'countdown':
+    elif problem.get('task') == 'countdown':
         target = problem['target']
         if target != 0 and math.isclose(predicted_answer_num, target, rel_tol=tolerance):
             final_answer_correct = True
@@ -186,14 +342,14 @@ def compute_reward_with_partial_credit(
     
     # --- Check for Reasoning (within proper format) ---
     if check_reasoning:
-        if problem['task'] == 'multiplication':
+        if problem.get('task') == 'multiplication':
             has_reasoning = check_multiplication_cot(
                 generated_text,
                 problem['num1'],
                 problem['num2'],
                 problem['answer']
             )
-        elif problem['task'] == 'countdown':
+        elif problem.get('task') == 'countdown':
             has_reasoning = check_countdown_reasoning(
                 generated_text,
                 problem['numbers'],
@@ -223,25 +379,12 @@ def compute_reward_with_partial_credit(
             return 0.0  # Nothing good
 
 
-def compute_reward(
-    generated_text: str,
-    problem: Dict[str, Any],
-    tolerance: float = 0.01,
-    require_cot: bool = False
-) -> float:
-    """
-    Binary reward function - for V* computation.
-    No partial credit - just 1.0 or 0.0.
-    """
-    return compute_reward_with_partial_credit(
-        generated_text, problem, tolerance, check_reasoning=False
-    )
-
-
 # Export functions
 __all__ = [
     'compute_reward',
     'compute_reward_with_partial_credit',
+    'compute_math_reward',
+    'compute_webshop_reward',
     'extract_final_answer',
     'check_multiplication_cot',
     'check_countdown_reasoning',

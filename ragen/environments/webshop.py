@@ -65,22 +65,34 @@ class WebShopEnvironment(MultiTurnEnvironment):
         # Get session ID if provided
         self.session = task_data.get('session', None)
         
-        # Reset WebShop environment
-        obs_tuple = self.env.reset(session=self.session)
-        
-        # WebShop returns (observation, info) tuple
-        if isinstance(obs_tuple, tuple):
-            obs = obs_tuple[0]
-        else:
-            obs = obs_tuple
-        
-        # Extract instruction from observation
-        if '[SEP]' in obs:
-            parts = obs.split('[SEP]')
-            if len(parts) >= 3:
-                self.current_instruction = parts[2].strip()
-        
-        return obs
+        try:
+            # Reset WebShop environment
+            obs_tuple = self.env.reset(session=self.session)
+            
+            # WebShop returns (observation, info) tuple
+            if isinstance(obs_tuple, tuple):
+                obs = obs_tuple[0]
+            else:
+                obs = obs_tuple
+            
+            # Validate observation
+            if obs is None or not isinstance(obs, str):
+                print(f"⚠️  Invalid observation from reset: {obs}")
+                obs = "Welcome to WebShop! Please search for products."
+            
+            # Extract instruction from observation
+            if '[SEP]' in obs:
+                parts = obs.split('[SEP]')
+                if len(parts) >= 3:
+                    self.current_instruction = parts[2].strip()
+            
+            return obs
+            
+        except Exception as e:
+            print(f"⚠️  Error in reset: {e}")
+            import traceback
+            traceback.print_exc()
+            return "Welcome to WebShop! Please search for products."
     
     def step(self, action: str) -> Tuple[str, float, bool, Dict]:
         """
@@ -94,31 +106,83 @@ class WebShopEnvironment(MultiTurnEnvironment):
         """
         self.current_turn += 1
         
+        # Initialize info dict FIRST to prevent NoneType errors
+        info = {
+            'turn': self.current_turn,
+            'max_turns': self.max_turns,
+            'timeout': False,
+            'success': False,
+            'error': None
+        }
+        
+        # Validate action
+        if action is None or (isinstance(action, str) and not action.strip()):
+            print(f"⚠️  Invalid action at turn {self.current_turn}: {repr(action)}")
+            info['error'] = 'invalid_action'
+            obs = "Invalid action. Please try again."
+            return obs, 0.0, True, info
+        
         # Execute action in real WebShop
         try:
             result = self.env.step(action)
             
-            # WebShop returns (obs, reward, done, info)
-            if len(result) == 4:
-                obs, reward, done, info = result
+            # WebShop should return (obs, reward, done, info)
+            if isinstance(result, tuple):
+                if len(result) == 4:
+                    obs, reward, done, raw_info = result
+                elif len(result) == 3:
+                    obs, reward, done = result
+                    raw_info = {}
+                else:
+                    raise ValueError(f"Unexpected result length: {len(result)}")
             else:
-                obs, reward, done = result
-                info = {}
+                # Unexpected return type
+                print(f"⚠️  WebShop returned non-tuple: {type(result)}")
+                obs = str(result) if result else "Error: Invalid response"
+                reward = 0.0
+                done = True
+                raw_info = {}
+            
+            # Validate observation
+            if obs is None:
+                print(f"⚠️  WebShop returned None observation")
+                obs = "No observation available."
+                info['error'] = 'none_observation'
+            
+            # Update info with WebShop's info (safely)
+            if raw_info and isinstance(raw_info, dict):
+                info.update(raw_info)
+            
+            # Convert reward to float
+            reward = float(reward) if reward is not None else 0.0
+            
+            # Convert done to bool
+            done = bool(done) if done is not None else False
                 
         except Exception as e:
-            print(f"WebShop step error: {e}")
-            obs = f"Error: Invalid action '{action}'"
+            print(f"⚠️  WebShop step error at turn {self.current_turn}: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            obs = f"Error occurred: {str(e)}"
             reward = 0.0
             done = True
-            info = {'error': str(e)}
+            info['error'] = str(e)
         
-        # Add turn limit check
+        # Check for timeout (after getting results from env)
         if self.current_turn >= self.max_turns and not done:
             done = True
             info['timeout'] = True
         
+        # Check for success (reward > 0 typically means success in WebShop)
+        if reward > 0:
+            info['success'] = True
+        
         # Store in history
-        self.add_to_history(obs, action, reward)
+        try:
+            self.add_to_history(obs, action, reward)
+        except Exception as e:
+            print(f"⚠️  Error adding to history: {e}")
         
         return obs, reward, done, info
     
@@ -135,4 +199,6 @@ class WebShopEnvironment(MultiTurnEnvironment):
     
     def render_text(self, state: str) -> str:
         """Render state as text"""
-        return state
+        if state is None:
+            return ""
+        return str(state)
