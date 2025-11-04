@@ -54,7 +54,7 @@ def evaluate(
             try:
                 outputs = model.generate(
                     prompts,
-                    max_length=512,
+                    max_length=100,
                     min_new_tokens=50,
                     temperature=0.7,
                     do_sample=True

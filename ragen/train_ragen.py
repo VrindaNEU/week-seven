@@ -20,6 +20,14 @@ from ragen.agent_trainer import MultiTurnAPOTrainer
 from ragen.webshop_data_real import create_webshop_dataloaders
 from ragen.environments import WebShopEnvironment
 
+#  Action sanitizer import (required by WebShop env to normalize actions)
+try:
+    from ragen.action_sanitizer import sanitize
+except Exception:
+    # Fallback (no-op) if sanitizer module isn't present; training will still run
+    def sanitize(text, fallback_query=None):
+        return (text or "").strip()
+
 
 def parse_args():
     """Parse command line arguments"""
@@ -205,7 +213,8 @@ class RAGENTrainer:
                 self.reward_meter.reset()
             
             # Evaluation (only if eval_every is reasonable)
-            if (self.global_step % self.config['training']['eval_every'] == 0 and 
+            if (self.global_step > 0 and
+                self.global_step % self.config['training']['eval_every'] == 0 and 
                 self.config['training']['eval_every'] < 100):
                 self.log(f"\n{'='*50}")
                 self.log(f"Running evaluation at step {self.global_step}...")
@@ -236,7 +245,8 @@ class RAGENTrainer:
                 self.policy.train()
             
             # Checkpointing (only if save_every is reasonable)
-            if (self.global_step % self.config['training']['save_every'] == 0 and
+            if (self.global_step > 0 and
+                self.global_step % self.config['training']['save_every'] == 0 and
                 self.config['training']['save_every'] < 100):
                 checkpoint_path = self.output_dir / f'checkpoint_{self.global_step}.pt'
                 save_checkpoint(
@@ -267,26 +277,47 @@ class RAGENTrainer:
         
         print(f"\n🔍 Evaluating on {len(self.eval_loader.dataset)} tasks...")
         
+        # Pull commonly used knobs from config
+        model_cfg = self.config.get('model', {})
+        sampling_cfg = self.config.get('sampling', {})
+        use_min_new_tokens = sampling_cfg.get('use_min_new_tokens', False)
+        min_new_tokens = sampling_cfg.get('min_new_tokens', 10)
+        gen_max_len = model_cfg.get('max_length', 512)
+
         for batch in tqdm(self.eval_loader, desc="Evaluating", leave=False):
             for task in batch:
                 # Run one episode
-                prompt = task['instruction']
                 state = self.environment.reset(task)
                 done = False
                 episode_reward = 0.0
                 
                 for turn in range(self.config['environment']['max_turns']):
-                    # Generate action
+                    # 1) Render state -> text observation
+                    if hasattr(self.environment, "render_text"):
+                        obs_text = self.environment.render_text(state)
+                    else:
+                        obs_text = str(state)
+
+                    # 2) Generate raw action text
                     with torch.no_grad():
-                        action = self.policy.generate(
-                            [state],
-                            max_length=512,
-                            min_new_tokens=10,
+                        gen_kwargs = dict(
+                            max_new_tokens=max(16, min_new_tokens if use_min_new_tokens else 32),
                             temperature=0.7,
-                            do_sample=True
-                        )[0]
+                            do_sample=True,
+                        )
+
+                        action_raw = self.policy.generate([obs_text], **gen_kwargs)[0]
                     
-                    # Execute
+                    # 3)  Sanitize into a valid WebShop action
+                    fallback_query = task.get("instruction", task.get("prompt", ""))
+                    action = sanitize(action_raw, fallback_query)
+
+                    # Optional: log first few eval transitions
+                    if total < 3 and turn == 0:
+                        print(f"[Eval] Obs: {obs_text[:100]!r}")
+                        print(f"[Eval] Raw: {action_raw!r}  ->  Sanitized: {action!r}")
+
+                    # 4) Step the environment
                     next_state, reward, done, info = self.environment.step(action)
                     episode_reward += reward
                     state = next_state
@@ -309,13 +340,13 @@ class RAGENTrainer:
         self.log("Starting RAGEN training...")
         self.log(f"Config: {self.config}")
         
-        # Run initial evaluation (SKIP in debug mode!)
+        # Run initial evaluation (SKIP in debug mode only if requested)
         if not self.skip_initial_eval:
             self.log("Running initial evaluation...")
             initial_success = self.evaluate()
             self.log(f"Initial success rate: {initial_success:.2%}")
         else:
-            self.log("⚡ Skipping initial evaluation (debug mode)")
+            self.log("⚡ Skipping initial evaluation (debug/flag)")
             initial_success = 0.0
         
         # Training loop
@@ -388,7 +419,7 @@ def main():
     # Create trainer
     trainer = RAGENTrainer(config, args.output_dir)
     
-    # Set skip initial eval flag
+    # Set skip initial eval flag (respect CLI flags; do NOT override later)
     trainer.skip_initial_eval = args.skip_initial_eval or args.debug
     
     # Resume from checkpoint if specified
@@ -408,7 +439,6 @@ def main():
         print(f"Success Rate: {success:.2%}")
         return
     
-    trainer.skip_initial_eval = True
     # Train
     trainer.train()
 

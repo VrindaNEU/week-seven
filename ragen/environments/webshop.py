@@ -198,7 +198,31 @@ class WebShopEnvironment(MultiTurnEnvironment):
         return float(total)
     
     def render_text(self, state: str) -> str:
-        """Render state as text"""
         if state is None:
-            return ""
-        return str(state)
+            state = ""
+
+        instruction = ""
+        if '[SEP]' in str(state):
+            parts = str(state).split('[SEP]')
+            if len(parts) >= 3:
+                instruction = parts[2].strip()
+        elif self.current_instruction:
+            instruction = self.current_instruction
+
+        examples = (
+            "Valid actions:\n"
+            "  • search[blue wireless headphones]\n"
+            "  • click[B09QKP7XQL]\n"
+            "  • buy now\n"
+            "  • back\n"
+        )
+
+        return (
+            f"Task: {instruction}\n\n"
+            f"{examples}"
+            "RULES:\n"
+            " - Output EXACTLY ONE LINE.\n"
+            " - No explanations. No extra text. No punctuation.\n"
+            " - Format must be one of: search[...], click[ASIN], buy now, back\n\n"
+            "Action:"
+        )

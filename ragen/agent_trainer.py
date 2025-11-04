@@ -10,6 +10,7 @@ from collections import deque
 
 # Import YOUR working TinyZero trainer
 from tinyzero.apo_trainer import APOTrainer
+from tinyzero.rewards import compute_reward
 
 
 class _SimpleVStarCache:
@@ -161,15 +162,16 @@ class MultiTurnAPOTrainer(APOTrainer):
                     
                     # Validate observation text
                     if not obs_text or not isinstance(obs_text, str):
-                        print(f"⚠️  Invalid observation at turn {turn}: {obs_text}")
+                        print(f"  Invalid observation at turn {turn}: {obs_text}")
                         break
                     
                     gen_kwargs = dict(
-                        max_length=self.gen_max_length,
+                        max_length=max(16, self.min_new_tokens if self.use_min_new_tokens else 32),
                         temperature=self.temperature,
                         do_sample=True,
                         top_p=self.top_p,
-                        top_k=self.top_k
+                        top_k=self.top_k,
+                        repetition_penalty=1.3,
                     )
                     if self.use_min_new_tokens:
                         gen_kwargs["min_new_tokens"] = self.min_new_tokens
@@ -177,16 +179,33 @@ class MultiTurnAPOTrainer(APOTrainer):
                     # Generate action
                     generated = self.policy.generate([obs_text], **gen_kwargs)
                     if not generated or not generated[0]:
-                        print(f"⚠️  Empty generation at turn {turn}")
+                        print(f"  Empty generation at turn {turn}")
                         break
                     action = generated[0]
+
+                    # Sanitize model output for environment compatibility
+                    from ragen.action_sanitizer import sanitize
+                    fallback_query = task.get("prompt", "")
+                    action = sanitize(action, fallback_query)
+
+
+                    # ADD THIS DEBUG LOGGING:
+                    if turn == 0 and self.step <= 5:  # Log first action of first 5 steps
+                        print(f"   Step {self.step}, Turn {turn}:")
+                        print(f"     Obs: {obs_text[:80]}...")
+                        print(f"     Action: '{action}'")
                     
                     # Execute step
                     next_state, reward, done, info = self.environment.step(action)
+
+
+                    # ADD THIS TOO:
+                    if turn == 0 and self.step <= 5:
+                        print(f"     Reward: {reward}, Done: {done}")
                     
                     # Validate step results
                     if next_state is None:
-                        print(f"⚠️  None state returned at turn {turn}")
+                        print(f"  None state returned at turn {turn}")
                         # Use the error message as state if available
                         next_state = info.get('error', 'Error occurred')
                     
@@ -205,7 +224,7 @@ class MultiTurnAPOTrainer(APOTrainer):
 
             # Validate trajectory before returning
             if not actions:
-                print(f"⚠️  No actions collected in trajectory")
+                print(f"  No actions collected in trajectory")
                 return None
             
             total_reward = float(np.sum(rewards)) if rewards else 0.0
@@ -213,8 +232,14 @@ class MultiTurnAPOTrainer(APOTrainer):
             
             # Ensure we have valid text
             if not full_text:
-                print(f"⚠️  Empty full_text after concatenation")
+                print(f"  Empty full_text after concatenation")
                 full_text = " "  # Minimum valid text
+
+            # ADD THIS LOGGING:
+            if self.step <= 10:  # First 10 steps only
+                print(f"     Trajectory {self.step}: {len(actions)} actions")
+                print(f"     First 3 actions: {[str(a)[:50] for a in actions[:3]]}")
+                print(f"     Rewards: {rewards}")
             
             return {
                 'states': states,
@@ -227,7 +252,7 @@ class MultiTurnAPOTrainer(APOTrainer):
             }
             
         except Exception as e:
-            print(f"⚠️  Rollout completely failed: {e}")
+            print(f"  Rollout completely failed: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -317,65 +342,66 @@ class MultiTurnAPOTrainer(APOTrainer):
 
     def train_step_multiturn(self, batch: List[Dict]) -> tuple:
         """
-        Multi-turn training step with robust rollout error handling and logging.
+        Multi-turn training step - FIXED to not train on dummy data.
         """
         prompts = [item.get('instruction', item.get('prompt', '')) for item in batch]
         device = self.policy.model.device
 
         try:
-            # 1) V*
-            V_star_np = self.compute_V_star_multiturn(prompts, problems=batch)
-            V_star_t = torch.tensor(V_star_np, dtype=torch.float32, device=device)
-
-            # 2) Collect trajectories (robust per-item try/except)
             self.policy.train()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            # 1) Collect trajectories - ONLY keep successful ones
             trajectories = []
+            successful_indices = []
             rollout_failures = 0
-            for p, prob in zip(prompts, batch):
+            
+            for i, (p, prob) in enumerate(zip(prompts, batch)):
                 traj = self._rollout_trajectory(p, prob, self.max_turns)
-                if traj is None:
-                    # Complete failure - use minimal dummy trajectory
+                if traj is not None:
+                    trajectories.append(traj)
+                    successful_indices.append(i)
+                else:
                     rollout_failures += 1
-                    print(f"Warning: Rollout returned None")
-                    traj = {
-                        'states': ['error'], 
-                        'actions': ['search[dummy]'], 
-                        'rewards': [0.0],
-                        'total_reward': 0.0, 
-                        'full_text': 'search[dummy]',
-                        'num_turns': 1, 
-                        'done': True
-                    }
-                trajectories.append(traj)
-                
-            if rollout_failures > 0:
-                print(f"  ⚠️  {rollout_failures}/{len(batch)} rollouts failed")
             
-            # Additional validation: ensure all trajectories have content
-            valid_trajectories = [t for t in trajectories if t['actions'] and t['full_text']]
-            if len(valid_trajectories) < len(trajectories):
-                print(f"  ⚠️  {len(trajectories) - len(valid_trajectories)} trajectories invalid after collection")
-            
-            # If ALL trajectories failed, skip this step
-            if not valid_trajectories:
-                print("  ⚠️  ALL trajectories failed - skipping step")
+            # Skip step if too many failures
+            if len(trajectories) < max(1, len(batch) * 0.3):
+                print(f"  ⚠️  Too many failures ({rollout_failures}/{len(batch)}) - skipping")
                 return 0.0, {
                     'loss': 0.0, 'avg_reward': 0.0, 'avg_advantage': 0.0,
                     'avg_v_star': 0.0, 'avg_kl_penalty': 0.0,
                     'avg_turns': 0.0, 'success_rate': 0.0,
                     'weight_mean': 1.0, 'weight_std': 0.0,
                     'grad_global_norm_unclipped': 0.0,
-                    'rollout_failures': len(batch),
+                    'rollout_failures': rollout_failures,
                 }
+            
+            if rollout_failures > 0:
+                print(f"  ⚠️  {rollout_failures}/{len(batch)} rollouts failed")
+            
+            # 2) Align everything to successful rollouts
+            prompts = [prompts[i] for i in successful_indices]
+            batch = [batch[i] for i in successful_indices]
+            
+            # 3) Compute V* only for successful prompts
+            V_star_np = self.compute_V_star_multiturn(prompts, problems=batch)
+            V_star_t = torch.tensor(V_star_np, dtype=torch.float32, device=device)
 
             generated_texts = [t['full_text'] for t in trajectories]
-            rewards_t = torch.tensor([t['total_reward'] for t in trajectories],
-                                     dtype=torch.float32, device=device)
 
-            # 3) Advantages / weights
+            # 4) Compute rewards
+            computed_rewards = []
+            for traj, prob in zip(trajectories, batch):
+                reward = compute_reward(traj, prob)
+                computed_rewards.append(reward)
+
+            rewards_t = torch.tensor(computed_rewards, dtype=torch.float32, device=device)
+
+            if self.step % 5 == 0:
+                print(f"  📊 Rewards: {computed_rewards}")
+
+            # 5) Advantages & weights
             advantages = rewards_t - V_star_t
             if len(advantages) > 1:
                 adv_norm = (advantages - advantages.mean()) / (advantages.std() + 1e-6)
@@ -388,11 +414,11 @@ class MultiTurnAPOTrainer(APOTrainer):
             elif self.weighting_scheme == 'shifted_advantage':
                 weights = (adv_norm + self.adv_clip).detach()
                 weights = weights / (weights.mean().clamp_min(1e-6))
-            else:  # 'adv'
+            else:
                 weights = (adv_norm + 1.0).clamp(min=0.1, max=5.0).detach()
                 weights = weights / (weights.mean().clamp_min(1e-6))
 
-            # 4) Tokenization (prompt + completion) with prompt-masking via parent helpers
+            # 6) Tokenization
             enc_prompts = self.policy.tokenizer(
                 prompts, return_tensors="pt", padding=True, truncation=True,
                 max_length=self.sft_max_length
@@ -404,9 +430,7 @@ class MultiTurnAPOTrainer(APOTrainer):
             enc_prompts = {k: v.to(device) for k, v in enc_prompts.items()}
             enc_comps = {k: v.to(device) for k, v in enc_comps.items()}
 
-            pad_id = self.policy.tokenizer.pad_token_id
-            if pad_id is None:
-                pad_id = getattr(self.policy.tokenizer, "eos_token_id", 0)
+            pad_id = self.policy.tokenizer.pad_token_id or self.policy.tokenizer.eos_token_id
 
             input_ids, attention_mask, labels = self._build_concat_with_labels(
                 enc_prompts["input_ids"], enc_comps["input_ids"], pad_id
@@ -415,15 +439,15 @@ class MultiTurnAPOTrainer(APOTrainer):
             attention_mask = attention_mask[:, :self.sft_max_length]
             labels = labels[:, :self.sft_max_length]
 
-            # 5) Forward (policy)
+            # 7) Forward pass
             outputs = self.policy.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=None
             )
-            per_ex_ce = self._per_example_ce_loss(outputs.logits, labels)  # [B]
+            per_ex_ce = self._per_example_ce_loss(outputs.logits, labels)
 
-            # 6) Optional KL to reference
+            # 8) KL term
             kl_term = torch.zeros_like(per_ex_ce)
             if self.kl_coef and self.kl_coef > 0.0 and hasattr(self.ref_model, "model"):
                 with torch.no_grad():
@@ -439,18 +463,17 @@ class MultiTurnAPOTrainer(APOTrainer):
 
             per_ex_total = per_ex_ce + kl_term
 
-            # 7) Weight & reduce
+            # 9) Weighted loss
             if torch.isnan(weights).any() or torch.isinf(weights).any():
-                print("Warning: NaN/Inf weights — resetting to 1s")
+                print("Warning: NaN/Inf weights")
                 weights = torch.ones_like(per_ex_total)
             weights = weights.to(device)
             loss = (per_ex_total * weights).mean()
 
-            # 8) Backprop with gradient stats
+            # 10) Backprop
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             unclipped_norm = self._grad_global_norm()
-            # Optional adaptive clip update (based on recent norms)
             self._maybe_adapt_clip(unclipped_norm)
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=self.clip_grad_norm)
             self.optimizer.step()
@@ -458,31 +481,23 @@ class MultiTurnAPOTrainer(APOTrainer):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            # 9) Metrics
+            # 11) Metrics
             self.step += 1
             loss_value = float(loss.item())
             avg_reward = float(rewards_t.mean().item())
             avg_advantage = float(advantages.mean().item())
             avg_v_star = float(V_star_t.mean().item())
             avg_kl = float(kl_term.mean().item())
-            avg_turns = float(np.mean([t['num_turns'] for t in trajectories])) if trajectories else 0.0
-            success_rate = float(np.mean([1.0 if t['total_reward'] > 0.5 else 0.0 for t in trajectories])) if trajectories else 0.0
+            avg_turns = float(np.mean([t['num_turns'] for t in trajectories]))
+            success_rate = float(np.mean([1.0 if t['total_reward'] > 0.5 else 0.0 for t in trajectories]))
 
-            # Weight stats
             w_mean = float(weights.mean().item())
             w_std  = float(weights.std().item())
 
-            # Optional V* stability logging every 50 steps
-            if self.step % 50 == 0:
-                v_std = float(V_star_t.std().item())
-                print(f"  V* distribution: mean={avg_v_star:.3f}, std={v_std:.3f}")
-
-            # Log line
             if self.step % self.config.get('logging', {}).get('log_every', 5) == 0:
                 print(
                     f"Step {self.step}: Loss={loss_value:.4f}, "
-                    f"Reward={avg_reward:.3f}, Success={success_rate:.2%}, "
-                    f"Grad||={unclipped_norm:.3f}, W(mean,std)=({w_mean:.3f},{w_std:.3f})"
+                    f"Reward={avg_reward:.3f}, Success={success_rate:.2%}"
                 )
 
             stats = {
@@ -501,12 +516,10 @@ class MultiTurnAPOTrainer(APOTrainer):
             return loss_value, stats
 
         except Exception as e:
-            print("\n--- Error in train_step_multiturn ---")
-            print(f"Step: {self.step}")
+            print(f"\n--- Error in train_step_multiturn ---")
             print(f"{type(e).__name__}: {e}")
-            import traceback, gc
+            import traceback
             traceback.print_exc()
-            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             return 0.0, {

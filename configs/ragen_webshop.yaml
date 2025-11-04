@@ -3,16 +3,16 @@
 model:
   name: "Qwen/Qwen2.5-3B"
   ref_model: "Qwen/Qwen2.5-3B"
-  max_length: 512          
-  sft_max_length: 1024     
+  max_length: 2048        
+  sft_max_length: 1000
   device: "cuda"
 
 apo:
   beta: 0.5
-  v_star_samples: 2        
+  v_star_samples: 2
   adaptive_vstar: true
-  learning_rate: 0.0000003
-  batch_size: 1            
+  learning_rate: 0.000001
+  batch_size: 1
   gradient_accumulation_steps: 8
   kl_coef: 0.03
   adv_clip: 2.0
@@ -25,20 +25,20 @@ sampling:
   top_p: 0.9
   top_k: 0
   use_min_new_tokens: true
-  min_new_tokens: 10
+  min_new_tokens: 1
 
 training:
   num_epochs: 1
-  max_steps: 150           # More steps for real training
+  max_steps: 150
   eval_every: 50
   save_every: 50
 
 environment:
   max_turns: 10
-  num_products: 100        # Use 100 products (faster)
+  num_products: 100
 
 data:
-  train_size: 100          # Start with 100 tasks
+  train_size: 100
   eval_size: 20
 
 logging:
